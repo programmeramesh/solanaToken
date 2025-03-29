@@ -12,6 +12,9 @@
 
 body {
   margin: 0;
+  padding: 0;
+  margin-left: 23rem;
+  max-width: 100%;
   display: flex;
   place-items: center;
   min-width: 320px;
