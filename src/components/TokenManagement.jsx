@@ -23,6 +23,7 @@ const TokenManagement = () => {
   const [loading, setLoading] = useState(false);
   const [solBalance, setSolBalance] = useState(0);
   const [testRecipient, setTestRecipient] = useState(null);
+  const [transactions, setTransactions] = useState([]);
   const [createdTokens, setCreatedTokens] = useState(() => {
     // Load saved tokens from localStorage on component mount
     const savedTokens = localStorage.getItem('createdTokens');
@@ -452,6 +453,71 @@ const TokenManagement = () => {
     toast.success('Test recipient address generated and filled!');
   };
 
+  const fetchTransactionHistory = async (tokenMint) => {
+    if (!publicKey || !tokenMint) return;
+
+    try {
+      const signatures = await connection.getSignaturesForAddress(
+        new PublicKey(tokenMint),
+        { limit: 10 }
+      );
+
+      const transactionDetails = await Promise.all(
+        signatures.map(async (sig) => {
+          const tx = await connection.getTransaction(sig.signature, {
+            maxSupportedTransactionVersion: 0,
+          });
+
+          let type = 'Unknown';
+          let amount = 0;
+          let fromAddress = '';
+          let toAddress = '';
+
+          if (tx) {
+            // Determine if it's a mint or transfer
+            if (tx.meta.preTokenBalances && tx.meta.postTokenBalances) {
+              const preBalances = tx.meta.preTokenBalances;
+              const postBalances = tx.meta.postTokenBalances;
+
+              if (preBalances.length === 0 && postBalances.length === 1) {
+                type = 'Mint';
+                amount = Number(postBalances[0].uiTokenAmount.amount) / Math.pow(10, postBalances[0].uiTokenAmount.decimals);
+                toAddress = postBalances[0].owner;
+              } else if (preBalances.length === 1 && postBalances.length === 2) {
+                type = 'Transfer';
+                fromAddress = preBalances[0].owner;
+                toAddress = postBalances[1].owner;
+                amount = Number(postBalances[1].uiTokenAmount.amount) / Math.pow(10, postBalances[1].uiTokenAmount.decimals);
+              }
+            }
+
+            return {
+              signature: sig.signature,
+              type,
+              amount,
+              fromAddress,
+              toAddress,
+              timestamp: new Date(tx.blockTime * 1000).toLocaleString(),
+            };
+          }
+          return null;
+        })
+      );
+
+      const validTransactions = transactionDetails.filter(tx => tx !== null);
+      setTransactions(validTransactions);
+    } catch (error) {
+      console.error('Error fetching transaction history:', error);
+      toast.error('Failed to fetch transaction history');
+    }
+  };
+
+  useEffect(() => {
+    if (tokenMint) {
+      fetchTransactionHistory(tokenMint);
+    }
+  }, [tokenMint, publicKey]);
+
   return (
     <div className="space-y-6">
       {/* Wallet Information */}
@@ -759,6 +825,58 @@ const TokenManagement = () => {
                 {tokenBalance}
               </p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Transaction History */}
+      {tokenMint && transactions.length > 0 && (
+        <div className="mt-8">
+          <h2 className="text-2xl font-bold mb-4">Transaction History</h2>
+          <div className="overflow-x-auto">
+            <table className="min-w-full bg-white border rounded-lg">
+              <thead className="bg-gray-100">
+                <tr>
+                  <th className="px-4 py-2">Type</th>
+                  <th className="px-4 py-2">Amount</th>
+                  <th className="px-4 py-2">From</th>
+                  <th className="px-4 py-2">To</th>
+                  <th className="px-4 py-2">Time</th>
+                  <th className="px-4 py-2">Signature</th>
+                </tr>
+              </thead>
+              <tbody>
+                {transactions.map((tx, index) => (
+                  <tr key={index} className="border-t">
+                    <td className="px-4 py-2">{tx.type}</td>
+                    <td className="px-4 py-2">{tx.amount}</td>
+                    <td className="px-4 py-2">
+                      {tx.fromAddress ? 
+                        `${tx.fromAddress.slice(0, 4)}...${tx.fromAddress.slice(-4)}` : 
+                        '-'
+                      }
+                    </td>
+                    <td className="px-4 py-2">
+                      {tx.toAddress ? 
+                        `${tx.toAddress.slice(0, 4)}...${tx.toAddress.slice(-4)}` : 
+                        '-'
+                      }
+                    </td>
+                    <td className="px-4 py-2">{tx.timestamp}</td>
+                    <td className="px-4 py-2">
+                      <a 
+                        href={`https://explorer.solana.com/tx/${tx.signature}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-500 hover:text-blue-700"
+                      >
+                        {`${tx.signature.slice(0, 4)}...${tx.signature.slice(-4)}`}
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
