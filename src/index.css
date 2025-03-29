@@ -11,14 +11,13 @@
 }
 
 body {
-  margin: 0;
   padding: 0;
-  margin-left: 23rem;
+  margin: 0;
   max-width: 100%;
   display: flex;
+  justify-self: center;
   place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
+  
 }
 
 h1 {
