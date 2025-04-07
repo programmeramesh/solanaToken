@@ -5,15 +5,25 @@ import {
   mintTo,
   transfer,
   getMint,
-  getAccount
+  getAccount,
+  createInitializeMintInstruction,
+  createTransferInstruction,
+  TOKEN_PROGRAM_ID
 } from '@solana/spl-token';
-import { Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { 
+  Keypair, 
+  LAMPORTS_PER_SOL, 
+  PublicKey,
+  SystemProgram,
+  Transaction
+} from '@solana/web3.js';
 import { useState, useEffect } from 'react';
 import { toast } from 'react-toastify';
 
 const TokenManagement = () => {
   const { connection } = useConnection();
-  const { publicKey } = useWallet();
+  const wallet = useWallet();
+  const { publicKey } = wallet;
   const [tokenName, setTokenName] = useState('');
   const [mintAmount, setMintAmount] = useState('');
   const [recipientAddress, setRecipientAddress] = useState('');
@@ -23,6 +33,7 @@ const TokenManagement = () => {
   const [loading, setLoading] = useState(false);
   const [solBalance, setSolBalance] = useState(0);
   const [testRecipient, setTestRecipient] = useState(null);
+  const [transactions, setTransactions] = useState([]);
   const [createdTokens, setCreatedTokens] = useState(() => {
     // Load saved tokens from localStorage on component mount
     const savedTokens = localStorage.getItem('createdTokens');
@@ -194,13 +205,18 @@ const TokenManagement = () => {
     }
 
     setLoading(true);
+    const toastId = toast.loading('Preparing to create token... Please wait.');
+
     try {
-      const mintAuthority = Keypair.generate();
-      
       // First check if the wallet has enough SOL
       const balance = await connection.getBalance(publicKey);
       if (balance < LAMPORTS_PER_SOL * 0.01) {
-        toast.error('Insufficient SOL balance. You need at least 0.01 SOL to create a token.');
+        toast.update(toastId, {
+          render: 'Insufficient SOL balance. You need at least 0.01 SOL to create a token.',
+          type: 'error',
+          isLoading: false,
+          autoClose: 5000
+        });
         toast.info(
           <div>
             <p>Get test SOL from:</p>
@@ -214,43 +230,122 @@ const TokenManagement = () => {
         return;
       }
 
-      const mint = await createMint(
-        connection,
-        await requestAirdrop(mintAuthority),
-        mintAuthority.publicKey, // mint authority should be the same keypair we're using for setup
-        mintAuthority.publicKey, // freeze authority
-        9
+      toast.update(toastId, {
+        render: 'Creating token... Please approve the transaction in your wallet.',
+        type: 'info',
+        isLoading: true
+      });
+
+      // Generate keypairs for the mint
+      const mintKeypair = Keypair.generate();
+      const mintAuthority = Keypair.generate();
+
+      // Calculate rent-exempt balance
+      const rent = await connection.getMinimumBalanceForRentExemption(82);
+
+      // Create account instruction
+      const createAccountInstruction = SystemProgram.createAccount({
+        fromPubkey: publicKey,
+        newAccountPubkey: mintKeypair.publicKey,
+        space: 82,
+        lamports: rent,
+        programId: TOKEN_PROGRAM_ID,
+      });
+
+      // Initialize mint instruction
+      const initializeMintInstruction = createInitializeMintInstruction(
+        mintKeypair.publicKey,
+        9, // 9 decimals
+        mintAuthority.publicKey,
+        mintAuthority.publicKey
       );
 
-      const tokenAccount = await getOrCreateAssociatedTokenAccount(
-        connection,
-        mintAuthority,
-        mint,
-        publicKey
-      );
+      // Create transaction and add instructions
+      const transaction = new Transaction();
+      transaction.add(createAccountInstruction, initializeMintInstruction);
 
-      // Store the mint authority keypair in localStorage
-      const mintAuthorityData = {
-        publicKey: mintAuthority.publicKey.toString(),
-        secretKey: Array.from(mintAuthority.secretKey)
-      };
-      localStorage.setItem(`mintAuthority_${mint.toString()}`, JSON.stringify(mintAuthorityData));
+      // Get latest blockhash
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = publicKey;
 
-      setTokenMint(mint);
-      
-      // Add the new token to the list
-      const tokenInfo = await fetchTokenInfo(mint);
-      if (tokenInfo) {
-        setCreatedTokens(prev => [...prev, { ...tokenInfo, name: tokenName }]);
+      // Sign with the mint keypair
+      transaction.partialSign(mintKeypair);
+
+      // Request wallet signature
+      toast.update(toastId, {
+        render: 'Please approve the transaction in your wallet...',
+        type: 'info',
+        isLoading: true
+      });
+
+      try {
+        // Sign and send transaction
+        const signed = await wallet.signTransaction(transaction);
+        const signature = await connection.sendRawTransaction(signed.serialize());
+        
+        // Wait for confirmation
+        const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+        
+        if (confirmation.value.err) {
+          throw new Error('Transaction failed to confirm');
+        }
+
+        toast.update(toastId, {
+          render: 'Creating token account... Please approve the next transaction.',
+          type: 'info',
+          isLoading: true
+        });
+
+        // Create associated token account
+        const tokenAccount = await getOrCreateAssociatedTokenAccount(
+          connection,
+          mintAuthority,
+          mintKeypair.publicKey,
+          publicKey
+        );
+
+        // Store the mint authority for future minting
+        const mintAuthorityData = {
+          publicKey: mintAuthority.publicKey.toString(),
+          secretKey: Array.from(mintAuthority.secretKey)
+        };
+        localStorage.setItem(`mintAuthority_${mintKeypair.publicKey.toString()}`, JSON.stringify(mintAuthorityData));
+
+        setTokenMint(mintKeypair.publicKey);
+        
+        // Add the new token to the list
+        const tokenInfo = await fetchTokenInfo(mintKeypair.publicKey);
+        if (tokenInfo) {
+          setCreatedTokens(prev => [...prev, { ...tokenInfo, name: tokenName }]);
+        }
+        
+        toast.update(toastId, {
+          render: 'Token created successfully! 🎉',
+          type: 'success',
+          isLoading: false,
+          autoClose: 5000
+        });
+
+        updateTokenBalance(mintKeypair.publicKey, tokenAccount.address);
+
+      } catch (signError) {
+        console.error('Transaction signing error:', signError);
+        toast.update(toastId, {
+          render: 'Transaction was not approved. Token creation cancelled.',
+          type: 'error',
+          isLoading: false,
+          autoClose: 5000
+        });
       }
-      
-      toast.success('Token created successfully!');
-      updateTokenBalance(mint, tokenAccount.address);
     } catch (error) {
       console.error('Error creating token:', error);
-      if (!error.toString().includes('429')) {
-        toast.error('Failed to create token. Please try again.');
-      }
+      toast.update(toastId, {
+        render: error.message || 'Failed to create token. Please try again.',
+        type: 'error',
+        isLoading: false,
+        autoClose: 5000
+      });
     } finally {
       setLoading(false);
     }
@@ -267,23 +362,49 @@ const TokenManagement = () => {
       return;
     }
 
+    // Show confirmation popup
+    const proceed = window.confirm(`Please confirm token minting:\n\nAmount: ${mintAmount} tokens\nToken: ${tokenMint.toString()}\n\nThis will mint new tokens to your wallet. Do you want to proceed?`);
+
+    if (!proceed) {
+      toast.info('Token minting cancelled');
+      return;
+    }
+
     setLoading(true);
+    const toastId = toast.loading('Preparing to mint tokens... Please wait.');
+
     try {
       let currentMintAuthority;
       
       // First try to get mint authority from localStorage
       const mintAuthorityData = localStorage.getItem(`mintAuthority_${tokenMint.toString()}`);
       if (!mintAuthorityData) {
+        toast.update(toastId, {
+          render: 'Recovering mint authority...',
+          type: 'info',
+          isLoading: true
+        });
         // If not found, try to recover it
         currentMintAuthority = await recoverMintAuthority(tokenMint.toString());
         if (!currentMintAuthority) {
-          toast.error('Could not recover mint authority. You may need to create a new token.');
+          toast.update(toastId, {
+            render: 'Could not recover mint authority. You may need to create a new token.',
+            type: 'error',
+            isLoading: false,
+            autoClose: 5000
+          });
           return;
         }
       } else {
         const mintAuthorityInfo = JSON.parse(mintAuthorityData);
         currentMintAuthority = Keypair.fromSecretKey(new Uint8Array(mintAuthorityInfo.secretKey));
       }
+
+      toast.update(toastId, {
+        render: 'Creating token account... Please approve the transaction.',
+        type: 'info',
+        isLoading: true
+      });
 
       const tokenAccount = await getOrCreateAssociatedTokenAccount(
         connection,
@@ -292,7 +413,13 @@ const TokenManagement = () => {
         publicKey
       );
 
-      await mintTo(
+      toast.update(toastId, {
+        render: 'Minting tokens... Please approve the transaction.',
+        type: 'info',
+        isLoading: true
+      });
+
+      const mintTx = await mintTo(
         connection,
         currentMintAuthority,
         tokenMint,
@@ -301,15 +428,38 @@ const TokenManagement = () => {
         BigInt(Number(mintAmount) * (10 ** 9))
       );
 
-      toast.success('Tokens minted successfully!');
+      // Wait for transaction confirmation
+      const confirmation = await connection.confirmTransaction(mintTx, 'confirmed');
+      
+      if (confirmation.value.err) {
+        throw new Error('Transaction failed to confirm');
+      }
+
+      toast.update(toastId, {
+        render: 'Tokens minted successfully! 🎉',
+        type: 'success',
+        isLoading: false,
+        autoClose: 5000
+      });
+
       await updateTokenBalance(tokenMint, tokenAccount.address);
       await refreshTokenBalances();
     } catch (error) {
       console.error('Error minting tokens:', error);
       if (error.message?.includes('insufficient funds')) {
-        toast.error('Insufficient SOL for transaction fees. You need a small amount of SOL to mint tokens.');
+        toast.update(toastId, {
+          render: 'Insufficient SOL for transaction fees. You need a small amount of SOL to mint tokens.',
+          type: 'error',
+          isLoading: false,
+          autoClose: 5000
+        });
       } else {
-        toast.error('Failed to mint tokens. You may need to create a new token.');
+        toast.update(toastId, {
+          render: error.message || 'Failed to mint tokens. Please try again.',
+          type: 'error',
+          isLoading: false,
+          autoClose: 5000
+        });
       }
     } finally {
       setLoading(false);
@@ -317,7 +467,12 @@ const TokenManagement = () => {
   };
 
   const transferTokens = async () => {
-    if (!publicKey || !tokenMint) {
+    if (!wallet.connected || !publicKey) {
+      toast.error('Please connect your wallet first');
+      return;
+    }
+
+    if (!tokenMint) {
       toast.error('Please create a token first');
       return;
     }
@@ -362,17 +517,31 @@ const TokenManagement = () => {
         destinationPubKey
       );
 
-      // Perform the transfer
-      const signature = await transfer(
-        connection,
-        payer,
-        sourceAccount.address,
-        destinationAccount.address,
-        publicKey,
-        BigInt(Number(transferAmount) * (10 ** 9))
+      // Create transfer instruction
+      const transaction = new Transaction().add(
+        createTransferInstruction(
+          sourceAccount.address,
+          destinationAccount.address,
+          publicKey,
+          BigInt(Number(transferAmount) * (10 ** 9))
+        )
       );
 
-      await connection.confirmTransaction(signature);
+      // Get latest blockhash
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = publicKey;
+
+      // Request wallet signature
+      const signed = await wallet.signTransaction(transaction);
+      const signature = await connection.sendRawTransaction(signed.serialize());
+      
+      // Wait for confirmation
+      const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+      
+      if (confirmation.value.err) {
+        throw new Error('Transaction failed to confirm');
+      }
       toast.success('Tokens transferred successfully!');
       
       // Update balances
@@ -380,12 +549,24 @@ const TokenManagement = () => {
       await refreshTokenBalances();
     } catch (error) {
       console.error('Error transferring tokens:', error);
+      
+      // Handle wallet connection errors
+      if (error.name === 'WalletSignTransactionError' && error.message?.includes('not connected')) {
+        toast.error('Wallet not connected. Please connect your wallet and try again.');
+        return;
+      }
+      
+      // Handle other specific errors
       if (error.message?.includes('insufficient funds')) {
         toast.error('Insufficient funds for transaction. Make sure you have enough tokens and SOL for fees.');
       } else if (error.message?.includes('0 tokens')) {
         toast.error('Insufficient token balance for transfer.');
       } else if (error.message?.includes('TokenAccountNotFoundError')) {
         toast.error('Error creating recipient token account. Make sure you have enough SOL for fees.');
+      } else if (error.message?.includes('invalid address')) {
+        toast.error('Invalid recipient address. Please check the address and try again.');
+      } else if (error.message?.includes('Transaction failed to confirm')) {
+        toast.error('Transaction failed to confirm. Please try again.');
       } else {
         toast.error('Failed to transfer tokens. Please try again.');
       }
@@ -451,6 +632,71 @@ const TokenManagement = () => {
     setRecipientAddress(testWallet.publicKey.toString());
     toast.success('Test recipient address generated and filled!');
   };
+
+  const fetchTransactionHistory = async (tokenMint) => {
+    if (!publicKey || !tokenMint) return;
+
+    try {
+      const signatures = await connection.getSignaturesForAddress(
+        new PublicKey(tokenMint),
+        { limit: 10 }
+      );
+
+      const transactionDetails = await Promise.all(
+        signatures.map(async (sig) => {
+          const tx = await connection.getTransaction(sig.signature, {
+            maxSupportedTransactionVersion: 0,
+          });
+
+          let type = 'Unknown';
+          let amount = 0;
+          let fromAddress = '';
+          let toAddress = '';
+
+          if (tx) {
+            // Determine if it's a mint or transfer
+            if (tx.meta.preTokenBalances && tx.meta.postTokenBalances) {
+              const preBalances = tx.meta.preTokenBalances;
+              const postBalances = tx.meta.postTokenBalances;
+
+              if (preBalances.length === 0 && postBalances.length === 1) {
+                type = 'Mint';
+                amount = Number(postBalances[0].uiTokenAmount.amount) / Math.pow(10, postBalances[0].uiTokenAmount.decimals);
+                toAddress = postBalances[0].owner;
+              } else if (preBalances.length === 1 && postBalances.length === 2) {
+                type = 'Transfer';
+                fromAddress = preBalances[0].owner;
+                toAddress = postBalances[1].owner;
+                amount = Number(postBalances[1].uiTokenAmount.amount) / Math.pow(10, postBalances[1].uiTokenAmount.decimals);
+              }
+            }
+
+            return {
+              signature: sig.signature,
+              type,
+              amount,
+              fromAddress,
+              toAddress,
+              timestamp: new Date(tx.blockTime * 1000).toLocaleString(),
+            };
+          }
+          return null;
+        })
+      );
+
+      const validTransactions = transactionDetails.filter(tx => tx !== null);
+      setTransactions(validTransactions);
+    } catch (error) {
+      console.error('Error fetching transaction history:', error);
+      toast.error('Failed to fetch transaction history');
+    }
+  };
+
+  useEffect(() => {
+    if (tokenMint) {
+      fetchTransactionHistory(tokenMint);
+    }
+  }, [tokenMint, publicKey]);
 
   return (
     <div className="space-y-6">
@@ -530,8 +776,13 @@ const TokenManagement = () => {
                     </button>
                     <button
                       onClick={() => {
-                        setTokenMint(new PublicKey(token.mint));
-                        toast.success('Token selected for minting/transfer');
+                        const pubKey = new PublicKey(token.mint);
+                        setTokenMint(pubKey);
+                        // Clear other form fields when selecting a new token
+                        setMintAmount('');
+                        setRecipientAddress('');
+                        setTestRecipient(null);
+                        toast.success('Token selected for operations');
                       }}
                       className="text-sm px-3 py-1 bg-purple-100 text-purple-700 rounded-full hover:bg-purple-200 transition-colors"
                     >
@@ -759,6 +1010,58 @@ const TokenManagement = () => {
                 {tokenBalance}
               </p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Transaction History */}
+      {tokenMint && transactions.length > 0 && (
+        <div className="mt-8">
+          <h2 className="text-2xl font-bold mb-4">Transaction History</h2>
+          <div className="overflow-x-auto">
+            <table className="min-w-full bg-white border rounded-lg">
+              <thead className="bg-gray-100">
+                <tr>
+                  <th className="px-4 py-2">Type</th>
+                  <th className="px-4 py-2">Amount</th>
+                  <th className="px-4 py-2">From</th>
+                  <th className="px-4 py-2">To</th>
+                  <th className="px-4 py-2">Time</th>
+                  <th className="px-4 py-2">Signature</th>
+                </tr>
+              </thead>
+              <tbody>
+                {transactions.map((tx, index) => (
+                  <tr key={index} className="border-t">
+                    <td className="px-4 py-2">{tx.type}</td>
+                    <td className="px-4 py-2">{tx.amount}</td>
+                    <td className="px-4 py-2">
+                      {tx.fromAddress ? 
+                        `${tx.fromAddress.slice(0, 4)}...${tx.fromAddress.slice(-4)}` : 
+                        '-'
+                      }
+                    </td>
+                    <td className="px-4 py-2">
+                      {tx.toAddress ? 
+                        `${tx.toAddress.slice(0, 4)}...${tx.toAddress.slice(-4)}` : 
+                        '-'
+                      }
+                    </td>
+                    <td className="px-4 py-2">{tx.timestamp}</td>
+                    <td className="px-4 py-2">
+                      <a 
+                        href={`https://explorer.solana.com/tx/${tx.signature}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-500 hover:text-blue-700"
+                      >
+                        {`${tx.signature.slice(0, 4)}...${tx.signature.slice(-4)}`}
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
